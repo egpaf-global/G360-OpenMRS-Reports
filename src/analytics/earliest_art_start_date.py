@@ -68,7 +68,7 @@ def concept_names():
     """)
 
 def obs_table():
-    obs_table = f"{settings.TARGET_SCHEMA}.order_type"
+    obs_table = f"{settings.TARGET_SCHEMA}.observation"
 
     return spark.sql(f"""
         SELECT * FROM {obs_table}
@@ -153,6 +153,6 @@ def earliest_start_date(end_date: str) -> DataFrame:
     return art_df.unionByName(arv_only_df)
 
 
-display(earliest_start_date("2026-06-30"))
-#display(obs_table())
+#display(earliest_start_date("2026-06-30"))
+display(obs_table())
 
