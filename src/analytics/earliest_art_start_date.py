@@ -75,7 +75,7 @@ def obs_table():
         LIMIT 10000;
     """)
 
-def arv_drug_earliest_start_date():
+def arv_drug_earliest_start_date(end_date: str):
     order_table = f"{settings.TARGET_SCHEMA}.order"
     order_type_table = f"{settings.TARGET_SCHEMA}.order_type"
     drug_table = f"{settings.TARGET_SCHEMA}.drug"
@@ -97,6 +97,7 @@ def arv_drug_earliest_start_date():
             ON d.drug_id = ad.drug_id
         WHERE ot.name = 'Drug Order'
           AND CAST(drug_o.quantity AS INT) > 0
+          AND DATE(o.start_date) <= '{end_date}'
         GROUP BY o.patient_id
         ORDER BY o.patient_id 
         LIMIT 10000
@@ -104,9 +105,9 @@ def arv_drug_earliest_start_date():
 
     return spark.sql(query)
     
-def earliest_start_date(end_date: str) -> DataFrame:
+def earliest_start_dateX(end_date: str) -> DataFrame:
     art_df = hiv_reg_earliest_start_date(end_date)
-    arv_df = arv_drug_earliest_start_date()
+    arv_df = arv_drug_earliest_start_date(end_date)
 
     art_df.createOrReplaceTempView("art_earliest")
     arv_df.createOrReplaceTempView("arv_earliest")
@@ -125,7 +126,33 @@ def earliest_start_date(end_date: str) -> DataFrame:
 
     return spark.sql(query)
 
+def earliest_start_date(end_date: str) -> DataFrame:
+    """
+    Returns all patients. If a patient exists in art_earliest_start_date, 
+    their ART record is returned and they are excluded from arv_drug_earliest.
+    """
+    art_df = (
+        hiv_reg_earliest_start_date(end_date)
+        .withColumnRenamed("person_id", "patient_id")
+        .withColumnRenamed("value_datetime", "earliest_start_date")
+        .withColumn("source", F.lit("ART_OBSERVATION"))
+        .select("patient_id", "earliest_start_date", "source")
+    )
 
-display(earliest_start_date("2026-08-01"))
+    arv_df = (
+        arv_drug_earliest_start_date(end_date)
+        .withColumnRenamed("first_obs_datetime", "earliest_start_date")
+        .withColumn("source", F.lit("ARV_DRUG_ORDER"))
+        .select("patient_id", "earliest_start_date", "source")
+    )
+
+    # 1. Get ARV patients that DO NOT exist in ART
+    arv_only_df = arv_df.join(art_df, "patient_id", "left_anti")
+
+    # 2. Combine all ART patients with remaining non-ART ARV patients
+    return art_df.unionByName(arv_only_df)
+
+
+display(earliest_start_date("2026-06-30"))
 #display(obs_table())
 
