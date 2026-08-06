@@ -219,7 +219,7 @@ def pill_count(end_date: str, site_id: int) -> DataFrame:
     return spark.sql(query)
 
 
-def arv_dispensing(end_date: str, site_id: int) -> DataFrame:
+def arv_dispensing(end_date: str, site_id: int):
     # 1. Execute Python functions to get DataFrames
     orders_df = arv_orders(end_date, site_id)
     pill_df = pill_count(end_date, site_id)

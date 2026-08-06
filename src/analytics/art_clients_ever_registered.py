@@ -8,7 +8,7 @@ tables = {
     for item in settings.TRANSACTION_TABLES
 }
 
-def ever_registered_art_clients(end_date: str, site_id: int = 870) -> DataFrame:
+def clients_ever_registered_at_art_clinic(end_date: str, site_id: int = 870):
     patient_table = tables["patient"]
     patient_program_table = tables["patient_program"]
     order_table = tables["order"]
@@ -54,4 +54,4 @@ def ever_registered_art_clients(end_date: str, site_id: int = 870) -> DataFrame:
     return spark.sql(query)
 
 # Execute and view full interactive result in Databricks
-display(ever_registered_art_clients("2026-06-30", site_id=870))
+display(clients_ever_registered_at_art_clinic("2026-06-30", site_id=870))

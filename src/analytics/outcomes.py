@@ -1,5 +1,7 @@
 from pyspark.sql import SparkSession, DataFrame
 from src import settings
+from src.analytics.pharmacy import arv_dispensing
+from src.analytics.art_clients_ever_registered import clients_ever_registered_at_art_clinic
 
 spark = SparkSession.builder.getOrCreate()
 
@@ -9,11 +11,7 @@ tables = {
 }
 
 
-def patient_adverse_outcome(
-    visit_date: str,
-    site_id: int = 870
-) -> DataFrame:
-
+def patient_adverse_outcome(visit_date: str, site_id: int = 870):
     patient_program_table = tables["patient_program"]
     patient_state_table = f"{settings.TARGET_SCHEMA}.patient_state"
     concept_name_table = f"{settings.TARGET_SCHEMA}.concept_name"
@@ -35,6 +33,7 @@ def patient_adverse_outcome(
             ps.start_date,
             ps.end_date,
             pws.concept_id,
+            pp.site_id,
             ROW_NUMBER() OVER (
                 PARTITION BY pp.patient_id
                 ORDER BY
@@ -67,282 +66,80 @@ def patient_adverse_outcome(
 
     return spark.sql(query)
 
+def get_alive_and_on_treatment(end_date: str, site_id: int = 870) -> DataFrame:
+    # 1. Fetch intermediate DataFrames
+    ever_registered_df = clients_ever_registered_at_art_clinic(end_date, site_id)
+    adverse_outcome_df = patient_adverse_outcome(end_date, site_id)
+    arv_dispensing_df = arv_dispensing(end_date, site_id)
+    
+    # 2. Register as Temporary Views
+    ever_registered_df.createOrReplaceTempView("tmp_art_ever_registered")
+    adverse_outcome_df.createOrReplaceTempView("tmp_patient_adverse_outcome")
+    arv_dispensing_df.createOrReplaceTempView("tmp_arv_dispensing_df")
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-def alive_and_on_treatment(
-    end_date: str,
-    site_id: int = 870
-) -> DataFrame:
-    """
-    Patients considered Alive and On Treatment.
-
-    Logic
-    -----
-    1. Find all ARV drug orders.
-    2. Add pill balances from the previous visit.
-    3. Find each patient's latest dispensing date.
-    4. Consider ALL ARVs dispensed on that date.
-    5. Calculate the minimum days of supply.
-    6. Add 30-day grace period.
-    """
-
-    order_table = tables["order"]
-    drug_order_table = tables["drug_order"]
-    observation_table = tables["observation"]
-    patient_program_table = tables["patient_program"]
-    patient_table = tables["patient"]
-
-    order_type_table = f"{settings.TARGET_SCHEMA}.order_type"
-    arv_drug_table = f"{settings.TARGET_SCHEMA}.arv_drug"
-
+    # 3. Query using Windowing and CTE encapsulation for status filtering
     query = f"""
-
-    ------------------------------------------------------------------
-    -- Pill balances
-    ------------------------------------------------------------------
-
-    WITH pill_remaining AS (
-
+    WITH latest_patient_dispensing AS (
         SELECT
-
-            order_id,
-
+            patient_id,
             site_id,
-
-            SUM(COALESCE(value_numeric,0)) AS pill_remaining
-
-        FROM {observation_table}
-
-        WHERE concept_id = 2540
-
-        GROUP BY
-
-            order_id,
-
-            site_id
-
+            quantity AS dispensed_quantity,
+            pill_count,
+            daily_dose,
+            start_date,
+            expiry_date,
+            ROW_NUMBER() OVER (
+                PARTITION BY patient_id, site_id
+                ORDER BY
+                    start_date DESC,
+                    expiry_date ASC,
+                    order_id DESC
+            ) AS rn
+        FROM tmp_arv_dispensing_df
     ),
-
-    ------------------------------------------------------------------
-    -- All ARV Orders
-    ------------------------------------------------------------------
-
-    arv_orders AS (
-
+    patient_outcomes AS (
         SELECT
-
-            o.patient_id,
-
-            o.site_id,
-
-            o.order_id,
-
-            o.start_date,
-
-            (
-                CAST(do.quantity AS DOUBLE)
-                +
-                COALESCE(pr.pill_remaining,0)
-            ) AS quantity,
-
-            COALESCE(
-                NULLIF(do.equivalent_daily_dose,0),
-                1
-            ) AS equivalent_daily_dose
-
-        FROM {order_table} o
-
-        INNER JOIN {order_type_table} ot
-            ON o.order_type_id = ot.order_type_id
-
-        INNER JOIN {drug_order_table} do
-            ON o.order_id = do.order_id
-           AND o.site_id = do.site_id
-
-        INNER JOIN {arv_drug_table} ad
-            ON do.drug_inventory_id = ad.drug_id
-
-        INNER JOIN {patient_program_table} pp
-            ON o.patient_id = pp.patient_id
-           AND o.site_id = pp.site_id
-
-        LEFT JOIN pill_remaining pr
-            ON o.order_id = pr.order_id
-           AND o.site_id = pr.site_id
-
-        WHERE
-
-            pp.program_id = 1
-
-            AND o.site_id = {site_id}
-
-            AND LOWER(ot.name) = 'drug order'
-
-            AND do.quantity > 0
-
-            AND DATE(o.start_date) <= DATE('{end_date}')
-
-    ),
-
-    ------------------------------------------------------------------
-    -- Latest dispensing visit
-    ------------------------------------------------------------------
-
-    latest_visit AS (
-
-        SELECT
-
-            patient_id,
-
-            site_id,
-
-            MAX(start_date) AS last_dispensed_date
-
-        FROM arv_orders
-
-        GROUP BY
-
-            patient_id,
-
-            site_id
-
-    ),
-
-    ------------------------------------------------------------------
-    -- All ARVs dispensed during latest visit
-    ------------------------------------------------------------------
-
-    latest_arvs AS (
-
-        SELECT
-
-            ao.patient_id,
-
-            ao.site_id,
-
-            ao.order_id,
-
-            ao.start_date,
-
-            ao.quantity,
-
-            ao.equivalent_daily_dose,
-
-            ao.quantity / ao.equivalent_daily_dose
-                AS days_of_supply
-
-        FROM arv_orders ao
-
-        INNER JOIN latest_visit lv
-
-            ON ao.patient_id = lv.patient_id
-
-           AND ao.site_id = lv.site_id
-
-           AND ao.start_date = lv.last_dispensed_date
-
-    ),
-
-    ------------------------------------------------------------------
-    -- Minimum supply among ARVs on latest visit
-    ------------------------------------------------------------------
-
-    patient_supply AS (
-
-        SELECT
-
-            patient_id,
-
-            site_id,
-
-            MAX(order_id) AS last_order_id,
-
-            MAX(start_date) AS last_dispensed_date,
-
-            MIN(days_of_supply) AS days_of_supply
-
-        FROM latest_arvs
-
-        GROUP BY
-
-            patient_id,
-
-            site_id
-
+            reg.patient_id,
+            reg.site_id,
+            pill.dispensed_quantity,
+            pill.pill_count,
+            pill.daily_dose,
+            pill.start_date AS drug_dispensed_date,
+            pill.expiry_date,
+            CASE
+                -- 1. Preserve explicit adverse outcome state if present
+                WHEN adv.state_name IS NOT NULL THEN adv.state_name
+                
+                -- 2. If no adverse outcome, check defaulting window (> 60 days past expiry)
+                WHEN pill.expiry_date IS NOT NULL 
+                     AND DATE_ADD(pill.expiry_date, 60) < DATE('{end_date}') 
+                THEN 'Defaulter'
+                
+                -- 3. Active on treatment
+                ELSE 'Alive and On Treatment'
+            END AS patient_status
+        FROM tmp_art_ever_registered reg
+        LEFT JOIN tmp_patient_adverse_outcome adv
+            ON reg.patient_id = adv.patient_id
+           AND reg.site_id = adv.site_id
+        LEFT JOIN latest_patient_dispensing pill
+            ON reg.patient_id = pill.patient_id
+           AND reg.site_id = pill.site_id
+           AND pill.rn = 1
     )
-
-    ------------------------------------------------------------------
-    -- Final Result
-    ------------------------------------------------------------------
-
     SELECT
-
-        p.patient_id,
-
-        p.birthdate,
-
-        p.birthdate_estimated,
-
-        p.gender,
-
-        p.site_id,
-
-        ps.last_order_id,
-
-        ps.last_dispensed_date,
-
-        ROUND(ps.days_of_supply,2) AS days_of_supply,
-
-        DATE_ADD(
-
-            ps.last_dispensed_date,
-
-            CAST(ps.days_of_supply + 30 AS INT)
-
-        ) AS outcome_date,
-
-        'Alive and On Treatment' AS patient_status
-
-    FROM patient_supply ps
-
-    INNER JOIN {patient_table} p
-
-        ON ps.patient_id = p.patient_id
-
-       AND ps.site_id = p.site_id
-
-    WHERE
-
-        DATE_ADD(
-
-            ps.last_dispensed_date,
-
-            CAST(ps.days_of_supply + 30 AS INT)
-
-        ) >= DATE('{end_date}')
-
-    ORDER BY
-
-        p.patient_id
-
+        patient_id,
+        site_id,
+        dispensed_quantity,
+        pill_count,
+        daily_dose,
+        drug_dispensed_date,
+        expiry_date,
+        patient_status
+    FROM patient_outcomes
+    WHERE patient_status = 'Defaulter' --- 'Alive and On Treatment'
     """
-
+    
     return spark.sql(query)
 
-
-display(alive_and_on_treatment("2026-06-30", site_id=870))
+display(get_alive_and_on_treatment("2026-06-30", site_id=870))
