@@ -11,19 +11,51 @@ tables = {
 }
 
 
-def patient_adverse_outcome(visit_date: str, site_id: int = 870):
+def patient_adverse_outcome(visit_date: str, site_id: int):
     patient_program_table = tables["patient_program"]
-    patient_state_table = f"{settings.TARGET_SCHEMA}.patient_state"
-    concept_name_table = f"{settings.TARGET_SCHEMA}.concept_name"
+
+    patient_state_table = (
+        f"{settings.TARGET_SCHEMA}.patient_state"
+    )
+
+    concept_name_table = (
+        f"{settings.TARGET_SCHEMA}.concept_name"
+    )
+
     program_workflow_state_table = (
         f"{settings.TARGET_SCHEMA}.program_workflow_state"
     )
+
     program_workflow_table = (
         f"{settings.TARGET_SCHEMA}.program_workflow"
     )
 
     query = f"""
-    WITH ranked_patient_states AS (
+    WITH concept_names AS (
+        -- One English name per concept (concept_name has multiple names per concept)
+        SELECT
+            concept_id,
+            name
+        FROM (
+            SELECT
+                concept_id,
+                name,
+                ROW_NUMBER() OVER (
+                    PARTITION BY concept_id
+                    ORDER BY
+                        locale_preferred DESC,
+                        CASE WHEN concept_name_type = 'FULLY_SPECIFIED' THEN 1 ELSE 0 END DESC,
+                        concept_name_id
+                ) AS name_rank
+            FROM {concept_name_table}
+            WHERE
+                locale = 'en'
+                AND voided = 0
+        )
+        WHERE name_rank = 1
+    ),
+
+    ranked_patient_states AS (
         SELECT
             pp.patient_id,
             pp.program_id,
@@ -35,7 +67,9 @@ def patient_adverse_outcome(visit_date: str, site_id: int = 870):
             pws.concept_id,
             pp.site_id,
             ROW_NUMBER() OVER (
-                PARTITION BY pp.patient_id
+                PARTITION BY
+                    pp.patient_id,
+                    pp.site_id
                 ORDER BY
                     ps.start_date DESC,
                     ps.date_created DESC,
@@ -43,22 +77,40 @@ def patient_adverse_outcome(visit_date: str, site_id: int = 870):
             ) AS state_rank
         FROM {patient_program_table} pp
         INNER JOIN {patient_state_table} ps
-            ON pp.patient_program_id = ps.patient_program_id
+            ON pp.patient_program_id =
+               ps.patient_program_id
+           AND pp.site_id =
+               ps.site_id
         INNER JOIN {program_workflow_state_table} pws
-            ON ps.state = pws.program_workflow_state_id
+            ON ps.state =
+               pws.program_workflow_state_id
         INNER JOIN {program_workflow_table} pw
-            ON pws.program_workflow_id = pw.program_workflow_id
-        INNER JOIN {concept_name_table} cn 
-            ON cn.concept_id = pws.concept_id
+            ON pws.program_workflow_id =
+               pw.program_workflow_id
+        INNER JOIN concept_names cn
+            ON cn.concept_id =
+               pws.concept_id
         WHERE
             pp.program_id = 1
             AND pp.site_id = {site_id}
-            AND DATE(ps.start_date) <= DATE('{visit_date}')
-            AND ps.state <> 7
+            AND DATE(ps.start_date)
+                <= DATE('{visit_date}')
     )
-    SELECT *
+
+    SELECT
+        patient_id,
+        program_id,
+        patient_state_id,
+        state,
+        state_name,
+        start_date,
+        end_date,
+        concept_id,
+        site_id
     FROM ranked_patient_states
-    WHERE state_rank = 1
+    WHERE
+        state_rank = 1
+        AND state NOT IN (1, 7)
     ORDER BY
         start_date DESC,
         patient_id
@@ -110,12 +162,14 @@ def get_alive_and_on_treatment(end_date: str, site_id: int = 870) -> DataFrame:
                 -- 1. Preserve explicit adverse outcome state if present
                 WHEN adv.state_name IS NOT NULL THEN adv.state_name
                 
-                -- 2. If no adverse outcome, check defaulting window (> 60 days past expiry)
-                WHEN pill.expiry_date IS NOT NULL 
-                     AND DATE_ADD(pill.expiry_date, 60) < DATE('{end_date}') 
+                -- 2. No ARV dispensing on/before end_date: cannot be Alive and On Treatment
+                WHEN pill.expiry_date IS NULL THEN 'No ARV dispensing'
+                
+                -- 3. If no adverse outcome, check defaulting window (> 60 days past expiry)
+                WHEN DATE_ADD(pill.expiry_date, 60) < DATE('{end_date}') 
                 THEN 'Defaulter'
                 
-                -- 3. Active on treatment
+                -- 4. Active on treatment (has ARV supply within the window)
                 ELSE 'Alive and On Treatment'
             END AS patient_status
         FROM tmp_art_ever_registered reg
@@ -137,9 +191,9 @@ def get_alive_and_on_treatment(end_date: str, site_id: int = 870) -> DataFrame:
         expiry_date,
         patient_status
     FROM patient_outcomes
-    WHERE patient_status = 'Defaulter' --- 'Alive and On Treatment'
+    ---WHERE patient_status IN('Alive and On Treatment') -- = 'Patient died' ---  Treatment stopped, Patient transferred out or died
     """
     
     return spark.sql(query)
 
-display(get_alive_and_on_treatment("2026-06-30", site_id=870))
+display(get_alive_and_on_treatment("2026-03-31", site_id=700))

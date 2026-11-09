@@ -29,19 +29,20 @@ def clients_ever_registered_at_art_clinic(end_date: str, site_id: int = 870):
             ON p.patient_id = pp.patient_id
            AND p.site_id = pp.site_id
            AND pp.program_id = 1
-        LEFT JOIN {order_table} o
+        -- Restrict to patients with at least one ARV drug order (ARVs identified via arv_drug)
+        INNER JOIN {order_table} o
             ON p.patient_id = o.patient_id
            AND p.site_id = o.site_id
            AND DATE(o.start_date) <= DATE('{end_date}')
-        LEFT JOIN {order_type_table} ot
+        INNER JOIN {order_type_table} ot
             ON o.order_type_id = ot.order_type_id
            AND LOWER(ot.name) = 'drug order'
-        LEFT JOIN {drug_order_table} do
+        INNER JOIN {drug_order_table} do
             ON o.order_id = do.order_id
            AND o.site_id = do.site_id
-        LEFT JOIN {drug_table} d
+        INNER JOIN {drug_table} d
             ON do.drug_inventory_id = d.drug_id
-        LEFT JOIN {arv_drug_table} ad
+        INNER JOIN {arv_drug_table} ad
             ON d.drug_id = ad.drug_id
         WHERE p.site_id = {site_id}
         AND do.quantity > 0
