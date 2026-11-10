@@ -1,0 +1,235 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>programsdev.malawi - OpenMRS ERD</title>
+<style>
+  body { font-family: Segoe UI, Arial, sans-serif; margin: 24px; color: #222; }
+  h1 { font-size: 22px; margin-bottom: 4px; }
+  h2 { font-size: 17px; margin-top: 28px; border-bottom: 1px solid #ddd; padding-bottom: 4px; }
+  .sub { color: #666; font-size: 13px; }
+  .toolbar { margin: 12px 0; }
+  button { padding: 6px 12px; margin-right: 8px; cursor: pointer; }
+  #erd { border: 1px solid #ddd; padding: 12px; overflow: auto; background: #fff; }
+  table { border-collapse: collapse; font-size: 13px; margin-top: 8px; }
+  th, td { border: 1px solid #ccc; padding: 5px 8px; text-align: left; vertical-align: top; }
+  th { background: #f3f3f3; }
+  code { background: #f5f5f5; padding: 1px 4px; border-radius: 3px; }
+  .legend li { margin: 3px 0; font-size: 13px; }
+</style>
+</head>
+<body>
+<h1>programsdev.malawi - OpenMRS data model (ERD)</h1>
+<div class="sub">Multi-site OpenMRS consolidation. Patient-side tables are site-scoped: keys are composite with <code>site_id</code>. Verified Nov 2026.</div>
+
+<div class="toolbar">
+  <button onclick="downloadSvg()">Download diagram as SVG</button>
+  <button onclick="downloadMermaid()">Download Mermaid source</button>
+</div>
+
+<div id="erd"><pre class="mermaid" id="erd-src">
+erDiagram
+    location {
+        bigint location_id PK "= site_id on all tables"
+        string name
+        string county_district
+        string region
+        string parent_location
+    }
+    patient {
+        bigint patient_id PK "unique per site only"
+        bigint site_id PK, FK
+        string gender
+        string birthdate
+        bigint birthdate_estimated
+    }
+    encounter {
+        bigint encounter_id PK
+        bigint site_id PK, FK
+        bigint patient_id FK
+        bigint encounter_type FK "-> encounter_type_id"
+        string encounter_datetime
+        bigint program_id FK
+        bigint provider_id
+    }
+    encounter_type {
+        bigint encounter_type_id PK
+        string name
+        bigint retired
+    }
+    observation {
+        bigint obs_id PK
+        bigint site_id PK, FK
+        bigint person_id FK "-> patient_id"
+        bigint encounter_id FK
+        bigint concept_id FK "question"
+        bigint value_coded FK "answer concept"
+        bigint value_coded_name_id FK "answer name"
+        bigint value_drug FK "-> drug_id"
+        double value_numeric
+        string value_text
+        string obs_datetime
+        bigint order_id FK
+        bigint obs_group_id FK "-> parent obs_id"
+    }
+    orders["order"] {
+        bigint order_id PK
+        bigint site_id PK, FK
+        bigint patient_id FK
+        bigint encounter_id FK
+        bigint order_type_id FK
+        bigint concept_id FK
+        string start_date
+        string auto_expire_date
+        string discontinued_date
+    }
+    order_type {
+        bigint order_type_id PK
+        string name "e.g. Drug order"
+    }
+    drug_order {
+        bigint order_id PK, FK
+        bigint site_id PK, FK
+        bigint drug_inventory_id FK "-> drug_id"
+        double quantity
+        double equivalent_daily_dose
+        string dose
+        string frequency
+    }
+    drug {
+        bigint drug_id PK
+        string name
+        bigint concept_id FK
+        bigint route
+        bigint dosage_form
+        bigint combination
+    }
+    arv_drug {
+        bigint drug_id PK, FK "83 ARVs"
+    }
+    program {
+        bigint program_id PK "1 = used as ART programme in reports"
+        bigint concept_id FK
+        string name
+    }
+    program_workflow {
+        bigint program_workflow_id PK
+        bigint program_id FK
+        bigint concept_id FK
+    }
+    program_workflow_state {
+        bigint program_workflow_state_id PK
+        bigint program_workflow_id FK
+        bigint concept_id FK
+        bigint initial
+        bigint terminal
+    }
+    patient_program {
+        bigint patient_program_id PK
+        bigint site_id PK, FK
+        bigint patient_id FK
+        bigint program_id FK
+        string date_enrolled
+        string date_completed
+    }
+    patient_state {
+        bigint patient_state_id PK
+        bigint site_id PK, FK
+        bigint patient_program_id FK
+        bigint state FK "-> program_workflow_state_id"
+        string start_date
+        string end_date "NULL = current"
+        string date_created
+    }
+    concept_name {
+        bigint concept_name_id PK "not strictly unique"
+        bigint concept_id "many names per concept"
+        string name
+        string locale
+        bigint locale_preferred
+        string concept_name_type
+        bigint voided
+    }
+
+    location ||--o{ patient : "site_id"
+    patient ||--o{ encounter : "patient_id + site_id"
+    encounter_type ||--o{ encounter : "encounter_type"
+    encounter ||--o{ observation : "encounter_id + site_id"
+    patient ||--o{ observation : "person_id + site_id"
+    observation |o--o{ observation : "obs_group_id = obs_id + site_id"
+    patient ||--o{ orders : "patient_id + site_id"
+    encounter ||--o{ orders : "encounter_id + site_id"
+    order_type ||--o{ orders : "order_type_id"
+    orders ||--o| drug_order : "order_id + site_id"
+    orders |o--o{ observation : "order_id + site_id"
+    drug ||--o{ drug_order : "drug_inventory_id"
+    drug ||--o| arv_drug : "drug_id (ARV flag)"
+    patient ||--o{ patient_program : "patient_id + site_id"
+    program ||--o{ patient_program : "program_id"
+    program ||--o{ program_workflow : "program_id"
+    program_workflow ||--o{ program_workflow_state : "program_workflow_id"
+    patient_program ||--o{ patient_state : "patient_program_id + site_id"
+    program_workflow_state ||--o{ patient_state : "state"
+    concept_name }o--o{ observation : "concept_id / value_coded / value_coded_name_id"
+    concept_name }o--o{ program_workflow_state : "concept_id"
+    concept_name }o--o{ program : "concept_id"
+    concept_name }o--o{ drug : "concept_id"
+</pre></div>
+
+<h2>Legend</h2>
+<ul class="legend">
+  <li><code>||--o{</code> one to zero-or-many; <code>||--o|</code> one to zero-or-one; <code>}o--o{</code> many to many (concept_name has several names per concept).</li>
+  <li>Multiple <code>PK</code> markers on a table = composite key (e.g. <code>patient_id + site_id</code>).</li>
+  <li>Every <code>site_id</code> references <code>location.location_id</code>; only the patient edge is drawn to keep the diagram readable.</li>
+  <li>Dictionary tables (no site_id): location, encounter_type, order_type, drug, arv_drug, program, program_workflow, program_workflow_state, concept_name.</li>
+</ul>
+
+<h2>Join rules</h2>
+<table>
+  <tr><th>From</th><th>To</th><th>Join condition</th><th>Notes</th></tr>
+  <tr><td>any table</td><td>location</td><td><code>t.site_id = location.location_id</code></td><td>Use site_id only, never a table's own location_id.</td></tr>
+  <tr><td>any patient-side table</td><td>patient</td><td><code>t.patient_id/person_id = p.patient_id AND t.site_id = p.site_id</code></td><td>patient_id is unique only within a site. Count with <code>COUNT(DISTINCT patient_id, site_id)</code>.</td></tr>
+  <tr><td>encounter</td><td>encounter_type</td><td><code>e.encounter_type = et.encounter_type_id</code></td><td>Column is named encounter_type, not encounter_type_id.</td></tr>
+  <tr><td>observation</td><td>encounter</td><td><code>o.encounter_id = e.encounter_id AND o.site_id = e.site_id</code></td><td>encounter_id alone is not unique (199.6M rows, 15.8M ids).</td></tr>
+  <tr><td>observation</td><td>observation (parent)</td><td><code>child.obs_group_id = parent.obs_id AND child.site_id = parent.site_id</code></td><td>Self-reference; never join obs_group_id to concept_name.</td></tr>
+  <tr><td>observation</td><td>concept_name</td><td>question: <code>o.concept_id</code>; answer: <code>o.value_coded</code>; answer name: <code>o.value_coded_name_id = concept_name_id</code></td><td>Three separate aliases. Answer label = COALESCE(name via value_coded_name_id, deduped name via value_coded).</td></tr>
+  <tr><td><code>`order`</code></td><td>order_type</td><td><code>o.order_type_id = ot.order_type_id</code></td><td>Table name is <code>order</code> (backtick-quote); (order_id, site_id) is unique.</td></tr>
+  <tr><td>drug_order</td><td><code>`order`</code></td><td><code>do.order_id = o.order_id AND do.site_id = o.site_id</code></td><td>No route/duration on drug_order; duration from order dates.</td></tr>
+  <tr><td>drug_order</td><td>drug</td><td><code>do.drug_inventory_id = d.drug_id</code></td><td>drug has 1,200 rows.</td></tr>
+  <tr><td>drug</td><td>arv_drug</td><td><code>d.drug_id = a.drug_id</code></td><td>A drug is an ARV only if it is in arv_drug (83 drugs). Do not match on names.</td></tr>
+  <tr><td>patient_state</td><td>patient_program</td><td><code>ps.patient_program_id = pp.patient_program_id AND ps.site_id = pp.site_id</code></td><td>Count enrolments from patient_program, not patient_state.</td></tr>
+  <tr><td>patient_state</td><td>program_workflow_state</td><td><code>ps.state = pws.program_workflow_state_id</code></td><td>Current state: end_date IS NULL or latest start_date.</td></tr>
+  <tr><td>program_workflow_state</td><td>program_workflow → program</td><td><code>pws.program_workflow_id = pw.program_workflow_id</code>, <code>pw.program_id = pr.program_id</code></td><td>Programme 1:N workflows 1:N states.</td></tr>
+  <tr><td>any concept_id</td><td>concept_name</td><td><code>x.concept_id = cn.concept_id</code></td><td>Dedupe first: locale='en', voided=0, ROW_NUMBER by locale_preferred DESC, FULLY_SPECIFIED first, lowest concept_name_id. No <code>concept</code> table exists.</td></tr>
+</table>
+
+<h2>General notes</h2>
+<ul class="legend">
+  <li>No voided columns on patient-side tables in this copy; all date columns are STRING (cast with DATE()/to_date).</li>
+  <li>Some programme 1 state concepts (1483, 1710, 1713, 3490, 5240) have no concept_name rows.</li>
+</ul>
+
+<script type="module">
+  import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
+  window.__erdSource = document.getElementById('erd-src').textContent;
+  mermaid.initialize({ startOnLoad: true, theme: 'default', er: { layoutDirection: 'TB', useMaxWidth: false } });
+</script>
+<script>
+  function save(name, type, content) {
+    const blob = new Blob([content], { type: type });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = name;
+    a.click();
+  }
+  function downloadSvg() {
+    const svg = document.querySelector('#erd svg');
+    if (!svg) { alert('Diagram not rendered yet (needs internet access to load Mermaid).'); return; }
+    save('malawi_openmrs_erd.svg', 'image/svg+xml', new XMLSerializer().serializeToString(svg));
+  }
+  function downloadMermaid() {
+    save('malawi_openmrs_erd.mmd', 'text/plain', window.__erdSource || document.getElementById('erd-src').textContent);
+  }
+</script>
+</body>
+</html>
