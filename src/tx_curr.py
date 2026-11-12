@@ -8,35 +8,13 @@ from pyspark.sql import SparkSession, DataFrame
 from pyspark.sql import functions as F
 from src import settings
 from src.analytics.outcomes import get_alive_and_on_treatment
+# Shared helpers (re-exported here so existing tx_curr.add_age_group etc. still work)
+from src.functions.age_group import AGE_GROUPS, AGE_GROUP_ORDER, add_age_group
+from src.functions.pregnancy import add_pregnancy_status
 
 spark = SparkSession.builder.getOrCreate()
 
 ALIVE_STATUS = "Alive and On Treatment"
-
-# Ordered (label, min_years, max_years); "<1 year" is handled by age_in_months.
-AGE_GROUPS = [
-    ("1-4 years", 1, 4),
-    ("5-9 years", 5, 9),
-    ("10-14 years", 10, 14),
-    ("15-19 years", 15, 19),
-    ("20-24 years", 20, 24),
-    ("25-29 years", 25, 29),
-    ("30-34 years", 30, 34),
-    ("35-39 years", 35, 39),
-    ("40-44 years", 40, 44),
-    ("45-49 years", 45, 49),
-    ("50-54 years", 50, 54),
-    ("55-59 years", 55, 59),
-    ("60-64 years", 60, 64),
-    ("65-69 years", 65, 69),
-    ("70-74 years", 70, 74),
-    ("75-79 years", 75, 79),
-    ("80-84 years", 80, 84),
-    ("85-89 years", 85, 89),
-]
-AGE_GROUP_ORDER = (
-    ["<1 year"] + [g[0] for g in AGE_GROUPS] + ["90 plus years", "Unknown"]
-)
 # Age groups / genders always shown in the report grid (zeros filled in)
 REPORT_AGE_GROUPS = AGE_GROUP_ORDER[:-1]
 REPORT_GENDERS = ["Female", "Male"]
@@ -51,6 +29,9 @@ MMD_COLUMNS = {
     "3-5 months": "# of clients on 3 - 5 months of ARVs",
     ">=6 months": "# of clients on >= 6 months of ARVs",
 }
+
+# Summary rows appended to the report (pregnant takes precedence over breastfeeding)
+PB_SUMMARY_ROWS = ["Male", "FP", "FNP", "FBF"]  # All Male, Female Pregnant / Not Pregnant / Breastfeeding
 
 tables = {
     item["table"]: f"{settings.TARGET_SCHEMA}.{item['table']}"
@@ -80,25 +61,6 @@ def patients(site_id: int = None):
         .dropDuplicates(["patient_id", "site_id"])
         .select("birthdate", "birthdate_estimated", "gender", "site_id")
     )
-
-
-def add_age_group(df: DataFrame, end_date: str, birthdate_col: str = "birthdate") -> DataFrame:
-    """Adds age_in_months, age_in_years and age_group (age as of end_date)."""
-    months = F.expr(f"timestampdiff(MONTH, to_date({birthdate_col}), to_date('{end_date}'))")
-    years = F.expr(f"timestampdiff(YEAR, to_date({birthdate_col}), to_date('{end_date}'))")
-
-    df = df.withColumn("age_in_months", months).withColumn("age_in_years", years)
-
-    age_group = F.when(
-        (F.col("age_in_months") >= 0) & (F.col("age_in_months") <= 11), "<1 year"
-    )
-    for label, lo, hi in AGE_GROUPS:
-        age_group = age_group.when(
-            (F.col("age_in_years") >= lo) & (F.col("age_in_years") <= hi), label
-        )
-    age_group = age_group.when(F.col("age_in_years") >= 90, "90 plus years").otherwise("Unknown")
-
-    return df.withColumn("age_group", age_group)
 
 
 def validate_period(start_date: str, end_date: str) -> tuple:
@@ -131,16 +93,17 @@ def tx_curr(
     end_date: str,
     site_id: int,
     defaulter_days: int = settings.DEFAULT_DEFAULTER_DAYS,
-    enrolled_in_period: bool = True,
+    enrolled_in_period: bool = False,
 ) -> DataFrame:
     """
     Patient-level TX_CURR for the reporting period start_date..end_date.
 
-    enrolled_in_period=True (default): only patients whose FIRST ART enrolment
-        (patient_program.date_enrolled, program 1) falls between start_date and
-        end_date (inclusive), and who are Alive and On Treatment at end_date.
-    enrolled_in_period=False: all patients Alive and On Treatment at end_date,
-        regardless of enrolment date (standard point-in-time TX_CURR).
+    enrolled_in_period=False (default): all patients Alive and On Treatment at
+        the end of the reporting period (end_date), regardless of when they
+        enrolled. This is the TX_CURR / TX_CURR MMD definition.
+    enrolled_in_period=True: optional cohort view - only patients whose FIRST ART
+        enrolment (patient_program.date_enrolled, program 1) falls between
+        start_date and end_date (inclusive) and who are Alive at end_date.
 
     Status, age and MMD are evaluated as of end_date.
     defaulter_days: 60 = MoH (default), 30 = PEPFAR.
@@ -176,6 +139,7 @@ def tx_curr(
 
     df = alive.join(p, ["patient_id", "site_id"], "left")
     df = add_age_group(df, end_date)
+    df = add_pregnancy_status(df, site_id)
 
     # MMD: days of ARVs dispensed at latest pickup (excludes pills brought back)
     days_dispensed = F.floor(F.col("dispensed_quantity") / F.col("daily_dose"))
@@ -199,30 +163,52 @@ def tx_curr_by_age_group(
     end_date: str,
     site_id: int,
     defaulter_days: int = settings.DEFAULT_DEFAULTER_DAYS,
-    enrolled_in_period: bool = True,
+    enrolled_in_period: bool = False,
 ) -> DataFrame:
     """
     TX_CURR report by gender and age_group with MMD columns for the period
     start_date..end_date (status evaluated as of end_date).
-    enrolled_in_period: see tx_curr() (True = only patients first enrolled in the period).
+    enrolled_in_period: see tx_curr() (default False = all patients alive on ART at end_date).
 
     Every standard age group is listed for Female and Male (zeros filled in);
     Unknown age/gender rows are appended only if they have patients.
+    Summary rows (Age group 'All') follow, as in the EMR export:
+    All Male, All FP (pregnant), All FNP (not pregnant/breastfeeding), All FBF (breastfeeding).
+    FP + FNP + FBF = all Female rows.
     tx_curr = sum of the three MMD columns (plus any patients with unknown MMD).
     """
-    counts = (
-        tx_curr(start_date, end_date, site_id, defaulter_days, enrolled_in_period)
-        .groupBy("age_group", "gender")
-        .agg(
-            F.countDistinct("patient_id").alias("tx_curr"),
-            *[
-                F.countDistinct(
-                    F.when(F.col("mmd_category") == cat, F.col("patient_id"))
-                ).alias(col)
-                for cat, col in MMD_COLUMNS.items()
-            ],
+    patients_df = tx_curr(start_date, end_date, site_id, defaulter_days, enrolled_in_period)
+    aggs = [
+        F.countDistinct("patient_id").alias("tx_curr"),
+        *[
+            F.countDistinct(
+                F.when(F.col("mmd_category") == cat, F.col("patient_id"))
+            ).alias(col)
+            for cat, col in MMD_COLUMNS.items()
+        ],
+    ]
+    counts = patients_df.groupBy("age_group", "gender").agg(*aggs)
+
+    # Summary rows: All Male + Female by pregnancy status (zeros filled in)
+    summary = (
+        patients_df.withColumn(
+            "summary_group",
+            F.when(F.col("gender") == "Male", "Male").otherwise(F.col("pregnancy_status")),
         )
+        .filter(F.col("summary_group").isNotNull())
+        .groupBy(F.col("summary_group").alias("gender"))
+        .agg(*aggs)
     )
+    summary = (
+        spark.createDataFrame([(g,) for g in PB_SUMMARY_ROWS], "gender string")
+        .join(summary, "gender", "left")
+        .fillna(0, subset=["tx_curr", *MMD_COLUMNS.values()])
+        .withColumns({"age_group": F.lit("All"), "_g": F.lit(len(GENDER_ORDER))})
+    )
+    summary_order = F.create_map(
+        *[x for i, g in enumerate(PB_SUMMARY_ROWS) for x in (F.lit(g), F.lit(i))]
+    )
+    summary = summary.withColumn("_a", summary_order[F.col("gender")])
 
     grid = spark.createDataFrame(
         [(a, g) for g in REPORT_GENDERS for a in REPORT_AGE_GROUPS],
@@ -239,14 +225,19 @@ def tx_curr_by_age_group(
     gender_order = F.create_map(
         *[x for i, g in enumerate(GENDER_ORDER) for x in (F.lit(g), F.lit(i))]
     )
+    report = report.withColumns(
+        {
+            "_g": gender_order[F.col("gender")],
+            "_a": age_order[F.col("age_group")],
+        }
+    ).unionByName(summary)
+
     return (
         report.withColumns(
             {
                 "site_id": F.lit(site_id),
                 "start_date": F.lit(start_date),
                 "end_date": F.lit(end_date),
-                "_g": gender_order[F.col("gender")],
-                "_a": age_order[F.col("age_group")],
             }
         )
         .orderBy("_g", "_a")
@@ -264,6 +255,6 @@ def tx_curr_by_age_group(
 
 # Example (only when run directly, not on import)
 if __name__ == "__main__":
-    display(tx_curr_by_age_group("2025-01-01", "2025-03-31", site_id=865))  # MoH, 60 days (default)
-    #display(tx_curr_by_age_group("2025-01-01", "2025-03-31", site_id=865, defaulter_days=settings.DEFAULTER_DAYS_PEPFAR))  # PEPFAR, 30 days
+    #display(tx_curr_by_age_group("2000-01-01", "2025-03-31", site_id=865))  # MoH, 60 days (default)
+    display(tx_curr_by_age_group("2000-01-01", "2025-03-31", site_id=865, defaulter_days=settings.DEFAULTER_DAYS_PEPFAR))  # PEPFAR, 30 days
     #display(tx_curr_by_age_group("2025-01-01", "2025-03-31", site_id=865, enrolled_in_period=False))  # all patients on ART at end_date
