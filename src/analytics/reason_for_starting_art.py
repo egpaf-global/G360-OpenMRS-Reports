@@ -9,28 +9,25 @@ All joins are on patient_id + site_id (patient_id is only unique within a site).
 
   get_reason_for_art(site_id)                     -> all patients at a site, one row per observation
   get_reason_for_art(site_id, patient_id=1234)    -> one patient's records
-  first_art_date(site_id[, patient_id])           -> 'ART start date' recorded in observation (earliest)
-  arv_start_date(site_id[, patient_id])           -> first ARV dispensing date per patient at this site
   reason_for_art_summary(site_id[, patient_id])   -> one row per patient: reason for STARTING ART
 
+Start dates come from src.functions.art_start_date:
+  clinic_start_date       - first ARV dispensing at this site (regardless of earlier ART elsewhere)
+  earliest_art_start_date - Ever received ART = Yes: 'ART start date' value_datetime on
+                            HIV CLINIC REGISTRATION; = No: first ARVs on/after HIV staging;
+                            always <= clinic_start_date
+
 Patients can be staged several times, so the reason for starting is the latest
-'Reason for ART eligibility' recorded ON the day ARVs were first dispensed; if
-none that day, the latest one recorded BEFORE that day. If the patient was only
-staged AFTER their first ARVs, the earliest staging after that day is used.
-The first ARV dispensing date at the site (first_arv_date_at_site) is always returned.
-
-first_art_date ('ART start date', concept 2516) should be the same as, or earlier
-than, first_arv_date_at_site; earlier usually means a transfer in who started ARVs
-at a previous site. art_date_check flags each case.
+'Reason for ART eligibility' recorded ON earliest_art_start_date; if none that day,
+the latest one recorded BEFORE it; if the patient was only staged AFTER it, the
+earliest staging after it.
 """
-
-from datetime import date
 
 from pyspark.sql import SparkSession, DataFrame
 from pyspark.sql import functions as F
 from pyspark.sql.window import Window
 from src import settings
-from src.analytics.pharmacy import arv_orders
+from src.functions.art_start_date import earliest_start_date
 
 spark = SparkSession.builder.getOrCreate()
 
@@ -38,7 +35,6 @@ REASON_FOR_ART_CONCEPT_ID = 7563   # 'Reason for ART eligibility'
 WHO_STAGE_CRITERIA_CONCEPT_ID = 2743  # 'Who stages criteria present'
 HIV_STAGING_ENCOUNTER = "HIV STAGING"
 ART_PROGRAM_ID = 1                 # 'HIV PROGRAM'
-ART_START_DATE_CONCEPT_ID = 2516   # 'ART start date' / 'Date antiretrovirals started' (value_datetime)
 
 
 def _table(name: str) -> str:
@@ -118,57 +114,41 @@ def get_reason_for_art(site_id: int, patient_id: int = None) -> DataFrame:
     )
 
 
-def first_art_date(site_id: int, patient_id: int = None) -> DataFrame:
-    """
-    'ART start date' (concept 2516, observation.value_datetime) per patient at a site,
-    usually captured at HIV CLINIC REGISTRATION. Some patients have it recorded more
-    than once with different dates; the earliest is returned.
-    """
-    obs = spark.read.table(_table("observation")).filter(
-        (F.col("site_id") == site_id)
-        & (F.col("concept_id") == ART_START_DATE_CONCEPT_ID)
-        & F.col("value_datetime").isNotNull()
-    )
-    if patient_id is not None:
-        obs = obs.filter(F.col("person_id") == patient_id)
-    return obs.groupBy("site_id", F.col("person_id").alias("patient_id")).agg(
-        F.min(F.to_date("value_datetime")).alias("first_art_date")
-    )
-
-
-def arv_start_date(site_id: int, patient_id: int = None, end_date: str = None) -> DataFrame:
-    """First ARV dispensing date per patient (ARV orders via pharmacy.arv_orders, up to end_date; default today)."""
-    orders = arv_orders(end_date or date.today().isoformat(), site_id)
-    if patient_id is not None:
-        orders = orders.filter(F.col("patient_id") == patient_id)
-    return orders.groupBy("site_id", "patient_id").agg(
-        F.min(F.to_date("start_date")).alias("arv_start_date")
-    )
-
-
 def reason_for_art_summary(
     site_id: int, patient_id: int = None, end_date: str = None
 ) -> DataFrame:
     """
-    One row per patient who has received ARVs at the site (up to end_date; default today):
-      first_art_date         - 'ART start date' from observation (concept 2516, earliest)
-      first_arv_date_at_site - date the patient first received ARVs at this site
-      art_date_check         - 'Same date' / 'ART start earlier (likely transfer in)' /
-                               'ART start later than first ARVs at site' / 'No ART start date'
-      reason_for_art         - 'Reason for ART eligibility', chosen in this order:
-                                 1. latest one on first_arv_date_at_site
-                                 2. else latest one before it
-                                 3. else earliest one after it
-                               (NULL only if the patient was never staged)
-      reason_date            - obs_datetime of that answer
-      days_from_arv_start    - reason date minus first_arv_date_at_site (negative = before, 0 = same day)
-      reason_source       - 'On ARV start date' / 'Before ARV start date' /
-                            'After ARV start date' / NULL
-      reason_encounter_id - HIV STAGING encounter the reason came from
-      who_stage_criteria  - 'Who stages criteria present' answers from that same
-                            staging encounter (sorted array)
+    One row per patient who has received ARVs at the site (up to end_date; default today).
+    Columns:
+      site_id, patient_id
+      ever_received_art_before    - 'Ever received ART?' at registration: Yes / No / Unknown /
+                                    Other / NULL (not asked)
+      earliest_art_start_date     - first ART anywhere (see src.functions.art_start_date);
+                                    always <= clinic_start_date
+      clinic_start_date           - first ARV dispensing at this site
+      art_date_check              - earliest_art_start_date vs clinic_start_date:
+                                    'Started before first ARVs at site (likely transfer in)' /
+                                    'Same date' /
+                                    'New initiation at site (Ever received ART = No)' /
+                                    'Missing ART start date (Ever received ART = Yes)' /
+                                    'Later date capped to first ARVs at site' (ART start date or
+                                    HIV staging recorded after the first ARVs at the site)
+      reason_for_art              - 'Reason for ART eligibility', chosen relative to
+                                    earliest_art_start_date:
+                                      1. latest one on that date
+                                      2. else latest one before it
+                                      3. else earliest one after it
+                                    (NULL only if the patient was never staged)
+      reason_date                 - obs_datetime of that answer
+      days_from_clinic_start_date - reason date minus clinic_start_date (negative = before,
+                                    0 = same day)
+      who_stage_criteria          - 'Who stages criteria present' answers from the same
+                                    staging encounter as the reason (sorted array)
     """
-    starts = arv_start_date(site_id, patient_id, end_date)
+    # Patients who received ARVs at the site; reason is chosen relative to earliest_start_date
+    starts = earliest_start_date(site_id, patient_id, end_date).withColumn(
+        "arv_start_date", F.col("earliest_start_date")
+    )
     obs = get_reason_for_art(site_id, patient_id).withColumn(
         "obs_date", F.to_date("obs_datetime")
     )
@@ -194,11 +174,7 @@ def reason_for_art_summary(
             "patient_id",
             F.col("answer").alias("reason_for_art"),
             F.col("obs_datetime").alias("reason_date"),
-            F.datediff("obs_date", "arv_start_date").alias("days_from_arv_start"),
-            F.when(F.col("obs_date") == F.col("arv_start_date"), "On ARV start date")
-            .when(F.col("obs_date") < F.col("arv_start_date"), "Before ARV start date")
-            .otherwise("After ARV start date")
-            .alias("reason_source"),
+            F.datediff("obs_date", "clinic_start_date").alias("days_from_clinic_start_date"),
             F.col("encounter_id").alias("reason_encounter_id"),
         )
     )
@@ -211,28 +187,33 @@ def reason_for_art_summary(
         .agg(F.array_sort(F.collect_set("answer")).alias("who_stage_criteria"))
     )
 
+    # 'ART start date' is entered manually at registration when 'Ever received ART?' = Yes;
+    # 'No' means a new initiation at this site.
+    ever = F.col("ever_received_art")
     art_date_check = (
-        F.when(F.col("first_art_date").isNull(), "No ART start date")
-        .when(F.col("first_art_date") == F.col("arv_start_date"), "Same date")
-        .when(F.col("first_art_date") < F.col("arv_start_date"), "ART start earlier (likely transfer in)")
-        .otherwise("ART start later than first ARVs at site")
+        F.when(F.col("earliest_start_source").endswith("capped to first ARVs at site"),
+               "Later date capped to first ARVs at site")
+        .when((ever == "Yes") & F.col("registration_art_start_date").isNull(),
+              "Missing ART start date (Ever received ART = Yes)")
+        .when(F.col("earliest_start_date") < F.col("clinic_start_date"),
+              "Started before first ARVs at site (likely transfer in)")
+        .when(ever == "No", "New initiation at site (Ever received ART = No)")
+        .otherwise("Same date")
     )
 
     return (
-        starts.join(first_art_date(site_id, patient_id), ["site_id", "patient_id"], "left")
-        .join(reason, ["site_id", "patient_id"], "left")
+        starts.join(reason, ["site_id", "patient_id"], "left")
         .join(criteria, ["site_id", "patient_id", "reason_encounter_id"], "left")
         .select(
             "site_id",
             "patient_id",
-            "first_art_date",
-            F.col("arv_start_date").alias("first_arv_date_at_site"),
+            F.col("ever_received_art").alias("ever_received_art_before"),
+            F.col("earliest_start_date").alias("earliest_art_start_date"),
+            "clinic_start_date",
             art_date_check.alias("art_date_check"),
             "reason_for_art",
             "reason_date",
-            "days_from_arv_start",
-            "reason_source",
-            "reason_encounter_id",
+            "days_from_clinic_start_date",
             "who_stage_criteria",
         )
     )
