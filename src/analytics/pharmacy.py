@@ -255,4 +255,6 @@ def arv_dispensing(end_date: str, site_id: int):
     return spark.sql(query)
 
 
-display(arv_dispensing("2026-06-30", 870))
+# Example (only when run directly, not on import)
+if __name__ == "__main__":
+    display(arv_dispensing("2026-06-30", 870))

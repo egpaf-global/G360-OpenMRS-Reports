@@ -118,7 +118,19 @@ def patient_adverse_outcome(visit_date: str, site_id: int):
 
     return spark.sql(query)
 
-def get_alive_and_on_treatment(end_date: str, site_id: int = 870) -> DataFrame:
+def get_alive_and_on_treatment(
+    end_date: str,
+    site_id: int = 870,
+    defaulter_days: int = settings.DEFAULT_DEFAULTER_DAYS,
+) -> DataFrame:
+    """
+    Patient outcome as of end_date.
+
+    defaulter_days: days after ARV run-out before a patient is a Defaulter.
+        60 = MoH (default), 30 = PEPFAR. See settings.DEFAULTER_DAYS_*.
+    """
+    defaulter_days = settings.validate_defaulter_days(defaulter_days)
+
     # 1. Fetch intermediate DataFrames
     ever_registered_df = clients_ever_registered_at_art_clinic(end_date, site_id)
     adverse_outcome_df = patient_adverse_outcome(end_date, site_id)
@@ -165,8 +177,8 @@ def get_alive_and_on_treatment(end_date: str, site_id: int = 870) -> DataFrame:
                 -- 2. No ARV dispensing on/before end_date: cannot be Alive and On Treatment
                 WHEN pill.expiry_date IS NULL THEN 'No ARV dispensing'
                 
-                -- 3. If no adverse outcome, check defaulting window (> 60 days past expiry)
-                WHEN DATE_ADD(pill.expiry_date, 60) < DATE('{end_date}') 
+                -- 3. If no adverse outcome, check defaulting window (> defaulter_days past expiry)
+                WHEN DATE_ADD(pill.expiry_date, {defaulter_days}) < DATE('{end_date}') 
                 THEN 'Defaulter'
                 
                 -- 4. Active on treatment (has ARV supply within the window)
@@ -196,4 +208,7 @@ def get_alive_and_on_treatment(end_date: str, site_id: int = 870) -> DataFrame:
     
     return spark.sql(query)
 
-display(get_alive_and_on_treatment("2026-03-31", site_id=700))
+
+# Example (only when run directly, not on import)
+if __name__ == "__main__":
+    display(get_alive_and_on_treatment("2026-03-31", site_id=700))

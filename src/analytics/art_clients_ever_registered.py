@@ -54,5 +54,6 @@ def clients_ever_registered_at_art_clinic(end_date: str, site_id: int = 870):
     # Return DataFrame directly (do not call .show() inside the function)
     return spark.sql(query)
 
-# Execute and view full interactive result in Databricks
-display(clients_ever_registered_at_art_clinic("2026-06-30", site_id=870))
+# Execute and view full interactive result in Databricks (only when run directly, not on import)
+if __name__ == "__main__":
+    display(clients_ever_registered_at_art_clinic("2026-06-30", site_id=870))
